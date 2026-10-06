@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <title>Kamera Absensi</title>
+  <script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/dist/face-api.js"></script>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;background:#071218;color:#fff;font-family:Arial,sans-serif;min-height:100vh}
+    .wrap{width:100%;max-width:480px;margin:auto;padding:14px}
+    .card{background:linear-gradient(180deg,#0c1f25,#071218);border:1px solid rgba(61,255,202,.22);border-radius:22px;padding:16px;box-shadow:0 20px 60px rgba(0,0,0,.35)}
+    h1{font-size:20px;text-align:center;margin:3px 0 4px}
+    .sub{font-size:12px;color:#a8c2c5;text-align:center;margin-bottom:12px;line-height:1.5}
+    .employee{font-size:12px;text-align:center;color:#b9d0d3;margin-bottom:10px}
+    .frame{position:relative;width:100%;aspect-ratio:3/4;background:#000;border-radius:18px;overflow:hidden;border:2px solid rgba(61,255,202,.28)}
+    video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1);display:block}
+    .overlay{position:absolute;inset:9% 12%;border:2px solid rgba(91,255,210,.9);border-radius:46% 46% 43% 43%;box-shadow:0 0 0 999px rgba(0,0,0,.18);pointer-events:none}
+    .scan{position:absolute;left:15%;right:15%;height:2px;top:50%;background:rgba(91,255,210,.85);box-shadow:0 0 14px rgba(91,255,210,.9);animation:scan 2s ease-in-out infinite;pointer-events:none}
+    @keyframes scan{0%,100%{transform:translateY(-70px);opacity:.35}50%{transform:translateY(70px);opacity:1}}
+    .status{margin-top:10px;padding:11px;border-radius:12px;background:rgba(255,255,255,.07);font-size:12px;text-align:center;line-height:1.5}
+    .ok{background:rgba(0,220,150,.13);color:#7dffd0}.bad{background:rgba(255,72,72,.13);color:#ffaaaa}
+    .gps{margin-top:8px;padding:9px;border-radius:10px;background:rgba(255,255,255,.05);font-size:11px;color:#a8c2c5;text-align:center}
+    .actions{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:10px}
+    button{border:0;border-radius:11px;padding:13px;font-size:13px;font-weight:800;cursor:pointer}
+    button:disabled{opacity:.45;cursor:not-allowed}
+    .primary{background:linear-gradient(135deg,#00d79b,#00a982);color:#fff}
+    .secondary{background:rgba(255,255,255,.10);color:#fff}
+    .retry{margin-top:9px;width:100%;background:#1d5f72;color:#fff}
+    .hint{font-size:11px;color:#819a9e;text-align:center;line-height:1.5;margin-top:9px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1 id="title">📷 Verifikasi Absensi</h1>
+    <div id="subtitle" class="sub">Pastikan hanya satu wajah berada di dalam bingkai.</div>
+    <div id="employee" class="employee"></div>
+
+    <div class="frame">
+      <video id="video" autoplay muted playsinline></video>
+      <div class="overlay"></div>
+      <div class="scan"></div>
+    </div>
+
+    <div id="status" class="status">Menyiapkan Face Recognition...</div>
+    <div id="gps" class="gps">GPS: belum diambil</div>
+
+    <div class="actions">
+      <button id="btnMain" class="primary" disabled>📸 VERIFIKASI & KIRIM</button>
+      <button id="btnCancel" class="secondary">BATAL</button>
+    </div>
+    <button id="btnRetry" class="retry hidden">🔄 COBA LAGI</button>
+
+    <div class="hint">Kamera dijalankan di halaman HTTPS terpisah agar izin kamera Android/iPhone tidak diblokir oleh sandbox Apps Script.</div>
+  </div>
+</div>
+
+<script>
+(function(){
+  'use strict';
+
+  const qs = new URLSearchParams(location.search);
+  const mode = qs.get('mode') || 'attendance';
+  const tipe = (qs.get('type') || 'MASUK').toUpperCase();
+  const nik = qs.get('nik') || '';
+  const requestId = qs.get('requestId') || '';
+  const openerWindow = window.opener;
+
+  const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/model';
+  const video = document.getElementById('video');
+  const statusEl = document.getElementById('status');
+  const gpsEl = document.getElementById('gps');
+  const btnMain = document.getElementById('btnMain');
+  const btnCancel = document.getElementById('btnCancel');
+  const btnRetry = document.getElementById('btnRetry');
+  const title = document.getElementById('title');
+  const subtitle = document.getElementById('subtitle');
+  const employee = document.getElementById('employee');
+
+  let stream = null;
+  let modelsReady = false;
+  let busy = false;
+  let locationData = null;
+
+  if (mode === 'register') {
+    title.textContent = '👤 Daftar Face ID';
+    subtitle.textContent = 'Posisikan satu wajah di dalam bingkai, lalu simpan Face ID.';
+    btnMain.textContent = '💾 SIMPAN FACE ID';
+  } else {
+    title.textContent = tipe === 'PULANG' ? '📷 Verifikasi Clock Out' : '📷 Verifikasi Clock In';
+    subtitle.textContent = 'Pastikan hanya satu wajah berada di dalam bingkai.';
+    employee.textContent = nik ? ('NIK: ' + nik) : '';
+  }
+
+  function setStatus(msg, ok, bad){
+    statusEl.textContent = msg;
+    statusEl.classList.toggle('ok', !!ok);
+    statusEl.classList.toggle('bad', !!bad);
+  }
+
+  function postToParent(payload){
+    if (!openerWindow) {
+      setStatus('Halaman ini harus dibuka dari aplikasi Absensi. Tutup halaman ini lalu ulangi dari aplikasi.', false, true);
+      return false;
+    }
+    try {
+      openerWindow.postMessage(Object.assign({
+        source:'ABSENSI_CAMERA_V1',
+        requestId:requestId,
+        mode:mode,
+        nik:nik
+      }, payload), '*');
+      return true;
+    } catch(err) {
+      setStatus('Gagal mengirim hasil ke aplikasi utama: ' + (err.message || err), false, true);
+      return false;
+    }
+  }
+
+  function stopCamera(){
+    if(stream){
+      stream.getTracks().forEach(function(track){ track.stop(); });
+      stream = null;
+    }
+    video.srcObject = null;
+  }
+
+  function cameraErrorMessage(err){
+    const name = err && err.name ? err.name : '';
+    if(name === 'NotAllowedError' || name === 'PermissionDeniedError') return 'Izin kamera ditolak. Tekan ikon kamera/gembok di browser lalu izinkan kamera.';
+    if(name === 'NotFoundError' || name === 'DevicesNotFoundError') return 'Kamera tidak ditemukan di perangkat.';
+    if(name === 'NotReadableError' || name === 'TrackStartError') return 'Kamera sedang dipakai aplikasi lain. Tutup aplikasi kamera lain lalu coba lagi.';
+    if(name === 'SecurityError') return 'Akses kamera diblokir oleh keamanan browser. Pastikan halaman dibuka melalui HTTPS.';
+    return 'Kamera gagal dibuka: ' + (err && err.message ? err.message : String(err || 'error'));
+  }
+
+  async function loadModels(){
+    if(modelsReady) return;
+    setStatus('Memuat Face Recognition...', false, false);
+    await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+    await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+    await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+    modelsReady = true;
+  }
+
+  async function startCamera(){
+    stopCamera();
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      throw new Error('Browser tidak mendukung akses kamera.');
+    }
+    setStatus('Meminta izin kamera...', false, false);
+    stream = await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'user'},width:{ideal:720},height:{ideal:960}},
+      audio:false
+    });
+    video.srcObject = stream;
+    await video.play();
+    setStatus('✓ Kamera aktif. Posisikan satu wajah di dalam bingkai.', true, false);
+    btnMain.disabled = false;
+  }
+
+  function getLocation(){
+    if(mode === 'register') return Promise.resolve(null);
+    if(!navigator.geolocation){
+      setStatus('GPS tidak tersedia di browser.', false, true);
+      return Promise.reject(new Error('GPS tidak tersedia.'));
+    }
+    gpsEl.textContent = 'GPS: mengambil lokasi...';
+    return new Promise(function(resolve,reject){
+      navigator.geolocation.getCurrentPosition(function(position){
+        locationData = {
+          latitude:position.coords.latitude,
+          longitude:position.coords.longitude,
+          accuracy:position.coords.accuracy
+        };
+        gpsEl.textContent = 'GPS: ✓ tersedia • akurasi sekitar ' + Math.round(position.coords.accuracy) + ' m';
+        resolve(locationData);
+      },function(error){
+        locationData = null;
+        gpsEl.textContent = 'GPS: gagal • ' + (error.message || 'izin ditolak');
+        reject(error);
+      },{enableHighAccuracy:true,timeout:15000,maximumAge:0});
+    });
+  }
+
+  async function detectOneFace(){
+    const detections = await faceapi
+      .detectAllFaces(video,new faceapi.TinyFaceDetectorOptions({inputSize:320,scoreThreshold:.55}))
+      .withFaceLandmarks()
+      .withFaceDescriptors();
+
+    if(!detections || detections.length === 0){
+      throw new Error('Wajah belum terdeteksi. Dekatkan wajah dan pastikan pencahayaan cukup.');
+    }
+    if(detections.length > 1){
+      throw new Error('Terdeteksi lebih dari satu wajah. Pastikan hanya satu orang di dalam bingkai.');
+    }
+    return detections[0];
+  }
+
+  function capturePhoto(){
+    const vw = video.videoWidth || 720;
+    const vh = video.videoHeight || 960;
+    const maxW = 720;
+    const scale = Math.min(1,maxW/vw);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(vw*scale);
+    canvas.height = Math.round(vh*scale);
+    const ctx = canvas.getContext('2d');
+    ctx.translate(canvas.width,0);
+    ctx.scale(-1,1);
+    ctx.drawImage(video,0,0,canvas.width,canvas.height);
+    return canvas.toDataURL('image/jpeg',.78);
+  }
+
+  async function submit(){
+    if(busy) return;
+    busy = true;
+    btnMain.disabled = true;
+    btnCancel.disabled = true;
+    btnRetry.classList.add('hidden');
+
+    try{
+      setStatus('Mendeteksi satu wajah...',false,false);
+      const result = await detectOneFace();
+      const descriptor = Array.from(result.descriptor);
+
+      if(mode === 'attendance'){
+        setStatus('Wajah terdeteksi. Memastikan GPS...',true,false);
+        let loc = locationData;
+        if(!loc){ loc = await getLocation(); }
+        setStatus('Wajah + GPS siap. Mengirim data ke aplikasi...',true,false);
+        const photo = capturePhoto();
+        postToParent({
+          type:'RESULT',
+          tipe:tipe,
+          descriptor:descriptor,
+          photo:photo,
+          location:loc
+        });
+      } else {
+        setStatus('Wajah terdeteksi. Mengirim Face ID ke aplikasi...',true,false);
+        postToParent({
+          type:'RESULT',
+          descriptor:descriptor
+        });
+      }
+
+      setStatus('✓ Berhasil dikirim. Anda dapat kembali ke aplikasi Absensi.',true,false);
+      stopCamera();
+      setTimeout(function(){
+        try{ window.close(); }catch(e){}
+      },400);
+    }catch(err){
+      console.error(err);
+      setStatus(err && err.message ? err.message : String(err),false,true);
+      btnCancel.disabled = false;
+      btnRetry.classList.remove('hidden');
+      busy = false;
+    }
+  }
+
+  async function init(){
+    if(!openerWindow){
+      setStatus('Halaman kamera harus dibuka dari aplikasi Absensi.',false,true);
+      btnMain.disabled = true;
+      return;
+    }
+    try{
+      await loadModels();
+      if(mode === 'attendance'){
+        /* Ambil GPS lebih awal, tetapi tombol tetap bisa dipakai lagi bila GPS gagal. */
+        getLocation().catch(function(){ });
+      }
+      await startCamera();
+    }catch(err){
+      console.error(err);
+      setStatus(cameraErrorMessage(err),false,true);
+      btnRetry.classList.remove('hidden');
+      btnMain.disabled = true;
+    }
+  }
+
+  btnMain.addEventListener('click',submit);
+  btnRetry.addEventListener('click',function(){
+    btnRetry.classList.add('hidden');
+    busy = false;
+    btnCancel.disabled = false;
+    init();
+  });
+  btnCancel.addEventListener('click',function(){
+    stopCamera();
+    postToParent({type:'CANCEL'});
+    setTimeout(function(){try{window.close();}catch(e){}},150);
+  });
+
+  window.addEventListener('beforeunload',stopCamera);
+  init();
+})();
+</script>
+</body>
+</html>
